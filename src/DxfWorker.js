@@ -42,6 +42,16 @@ export class DxfWorker {
         }
     }
 
+    async BuildScene(dxf, fonts, options, progressCbk) {
+        if (this.worker) {
+            return this._SendRequest(DxfWorker.WorkerMsg.BUILD_SCENE,
+                                        { dxf, fonts, options: this._CloneOptions(options) },
+                                        progressCbk)
+        } else {
+            return this._BuildScene(dxf, fonts, options, progressCbk)
+        }
+    }
+
     async Destroy(noWait = false) {
         if (this.worker) {
             if (!noWait) {
@@ -86,6 +96,17 @@ export class DxfWorker {
             transfers.push(scene.indices)
             transfers.push(scene.transforms)
             return {scene, dxf}
+        }
+        case DxfWorker.WorkerMsg.BUILD_SCENE: {
+            const scene = await this._BuildScene(
+                data.dxf,
+                data.fonts,
+                data.options,
+                (phase, size, totalSize) => this._SendProgress(seq, phase, size, totalSize))
+            transfers.push(scene.vertices)
+            transfers.push(scene.indices)
+            transfers.push(scene.transforms)
+            return scene
         }
         case DxfWorker.WorkerMsg.DESTROY:
             return null
@@ -143,7 +164,7 @@ export class DxfWorker {
         })
     }
 
-    /** @return {Object} DxfScene serialized scene. */
+    /** @return {Object} DxfScene serialized scene loaded from `url`. */
     async _Load(url, fonts, options, progressCbk) {
         let fontFetchers
         if (fonts) {
@@ -158,6 +179,22 @@ export class DxfWorker {
         const dxfScene = new DxfScene(options)
         await dxfScene.Build(dxf, fontFetchers)
         return {scene: dxfScene.scene, dxf: options.retainParsedDxf === true ? dxf : undefined }
+    }
+
+    /** @return {Object} DxfScene serialized scene built from `dxf`. */
+    async _BuildScene(dxf, fonts, options, progressCbk) {
+        let fontFetchers
+        if (fonts) {
+            fontFetchers = this._CreateFontFetchers(fonts, progressCbk)
+        } else {
+            fontFetchers = []
+        }
+        if (progressCbk) {
+            progressCbk("prepare", 0, null)
+        }
+        const dxfScene = new DxfScene(options)
+        await dxfScene.Build(dxf, fontFetchers)
+        return dxfScene.scene
     }
 
     _CreateFontFetchers(urls, progressCbk) {
@@ -202,7 +239,8 @@ export class DxfWorker {
 DxfWorker.WorkerMsg = {
     LOAD: "LOAD",
     PROGRESS: "PROGRESS",
-    DESTROY: "DESTROY"
+    DESTROY: "DESTROY",
+    BUILD_SCENE: "BUILD_SCENE"
 }
 
 DxfWorker.Request = class {

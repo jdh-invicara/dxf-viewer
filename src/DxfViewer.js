@@ -175,61 +175,87 @@ export class DxfViewer {
         await this.worker.Destroy()
         this.worker = null
         this.parsedDxf = dxf
+        this._BuildThreeJsScene(scene)
 
-        this.origin = scene.origin
-        this.bounds = scene.bounds
-        this.hasMissingChars = scene.hasMissingChars
-
-        for (const layer of scene.layers) {
-            this.layers.set(layer.name, new Layer(layer.name, layer.displayName, layer.color))
-        }
-
-        /* Load all blocks on the first pass. */
-        for (const batch of scene.batches) {
-            if (batch.key.blockName !== null &&
-                batch.key.geometryType !== BatchingKey.GeometryType.BLOCK_INSTANCE &&
-                batch.key.geometryType !== BatchingKey.GeometryType.POINT_INSTANCE) {
-
-                let block = this.blocks.get(batch.key.blockName)
-                if (!block) {
-                    block = new Block()
-                    this.blocks.set(batch.key.blockName, block)
-                }
-                block.PushBatch(new Batch(this, scene, batch))
-            }
-        }
-
-        console.log(`DXF scene:
-                     ${scene.batches.length} batches,
-                     ${this.layers.size} layers,
-                     ${this.blocks.size} blocks,
-                     vertices ${scene.vertices.byteLength} B,
-                     indices ${scene.indices.byteLength} B
-                     transforms ${scene.transforms.byteLength} B`)
-
-        /* Instantiate all entities. */
-        for (const batch of scene.batches) {
-            this._LoadBatch(scene, batch)
-        }
-
-        this._Emit("loaded")
-
-        if (scene.bounds) {
-            this.FitView(scene.bounds.minX - scene.origin.x, scene.bounds.maxX - scene.origin.x,
-                         scene.bounds.minY - scene.origin.y, scene.bounds.maxY - scene.origin.y)
-        } else {
-            this._Message("Empty document", MessageLevel.WARN)
-        }
-
-        if (this.hasMissingChars) {
-            this._Message("Some characters cannot be properly displayed due to missing fonts",
-                          MessageLevel.WARN)
-        }
-
-        this._CreateControls()
-        this.Render()
     }
 
+    /** Merge the provided dxf object into the previously loaded dxf object.  
+     * Old content is discarded, state is reset.
+     * @param fragment {?object}  The fragment of a DXF object to merge into the parsed DXF object
+     * @param fonts {?string[]} List of font URLs. Files should have typeface.js format. Fonts are
+     *  used in the specified order, each one is checked until necessary glyph is found. Text is not
+     *  rendered if fonts are not specified.
+     * @param progressCbk {?Function} (phase, processedSize, totalSize)
+     *  Possible phase values:
+     *  * "font"
+     *  * "prepare"
+     * @param workerFactory {?Function} Factory for worker creation. The worker script should
+     *  invoke DxfViewer.SetupWorker() function.
+     */
+    async AddDxfFragment({fragment, fonts = null, progressCbk = null, workerFactory = null}) {
+        if (!this.parsedDxf) {
+            throw new Error("You must use option `retainParsedDXF` to use this feature")
+        }
+        if (typeof(fragment) != "object") {
+            // TODO: implement proper schema checking
+            throw new Error("`fragment` must be an object with the same schema as the parsed DXF object")
+        }
+        
+        // STEP ONE: merge `fragment` into `this.parsedDxf`
+        let newFrag = Object.assign({}, fragment)
+        if (newFrag.entities) {
+            this.parsedDxf.entities = this.parsedDxf.entities.concat(newFrag.entities)
+        }
+        if (newFrag.blocks) {
+            Object.entries(newFrag.blocks).forEach(([k,v]) => this.parsedDxf.blocks[k] = v)
+        }
+        if (newFrag.header) {
+            Object.entries(newFrag.header).forEach(([k,v]) => this.parsedDxf.header[k] = v)
+        }
+        if (newFrag.tables) {
+            // Looping through TABLES
+            Object.entries(newFrag.tables).forEach(([k,v]) => {
+                console.log("Merging >> ", k)
+                if (this.parsedDxf.tables[k]) {
+                    // update existing table
+
+                    /* Assuming all tables have the following form:
+                    "tablename": {
+                        handle: "text"
+                        ownerHandle: "some other text"
+                        "tablenamecontents": {} // an object which we will add the new value to
+                    }
+                    */
+                    let newTableEntries = Object.values(v).filter((vv) => typeof(vv)=="object")
+                    if (newTableEntries.length != 1) {
+                        throw new Error("Unexpected format of fragment.tables.")
+                    }
+                    let existingTableEntries = Object.values(this.parsedDxf.tables[k]).filter((vv) => typeof(vv)=="object") 
+                    if (existingTableEntries.length != 1) {
+                        throw new Error("Unexpected format of existing tables")
+                    }
+                    // Adding ROWS
+                    Object.entries(newTableEntries[0]).forEach(([kk,vv]) => {
+                        existingTableEntries[0][kk] = vv
+                    })
+                }
+                else {
+                    // add new table
+                    this.parsedDxf.tables[k] = v
+                }
+            })
+        }
+
+        // STEP TWO: rebuild a new scene
+        this._EnsureRenderer()
+        this.Clear()
+        this.worker = new DxfWorker(workerFactory ? workerFactory() : null)
+        const scene = await this.worker.BuildScene(this.parsedDxf, fonts, progressCbk, workerFactory)
+        await this.worker.Destroy()
+        this.worker = null
+        this._BuildThreeJsScene(scene)
+    }
+    
     Render() {
         this._EnsureRenderer()
         this.renderer.render(this.scene, this.camera)
@@ -384,6 +410,64 @@ export class DxfViewer {
     }
 
     // /////////////////////////////////////////////////////////////////////////////////////////////
+
+    /** Takes the internal scene representation and renders the three.js scene
+     * Shared by Load() and AddDxfFragment()
+    */
+    _BuildThreeJsScene(scene) {
+        this.origin = scene.origin
+        this.bounds = scene.bounds
+        this.hasMissingChars = scene.hasMissingChars
+
+        for (const layer of scene.layers) {
+            this.layers.set(layer.name, new Layer(layer.name, layer.displayName, layer.color))
+        }
+
+        /* Load all blocks on the first pass. */
+        for (const batch of scene.batches) {
+            if (batch.key.blockName !== null &&
+                batch.key.geometryType !== BatchingKey.GeometryType.BLOCK_INSTANCE &&
+                batch.key.geometryType !== BatchingKey.GeometryType.POINT_INSTANCE) {
+
+                let block = this.blocks.get(batch.key.blockName)
+                if (!block) {
+                    block = new Block()
+                    this.blocks.set(batch.key.blockName, block)
+                }
+                block.PushBatch(new Batch(this, scene, batch))
+            }
+        }
+
+        console.log(`DXF scene:
+                        ${scene.batches.length} batches,
+                        ${this.layers.size} layers,
+                        ${this.blocks.size} blocks,
+                        vertices ${scene.vertices.byteLength} B,
+                        indices ${scene.indices.byteLength} B
+                        transforms ${scene.transforms.byteLength} B`)
+
+        /* Instantiate all entities. */
+        for (const batch of scene.batches) {
+            this._LoadBatch(scene, batch)
+        }
+
+        this._Emit("loaded")
+
+        if (scene.bounds) {
+            this.FitView(scene.bounds.minX - scene.origin.x, scene.bounds.maxX - scene.origin.x,
+                            scene.bounds.minY - scene.origin.y, scene.bounds.maxY - scene.origin.y)
+        } else {
+            this._Message("Empty document", MessageLevel.WARN)
+        }
+
+        if (this.hasMissingChars) {
+            this._Message("Some characters cannot be properly displayed due to missing fonts",
+                            MessageLevel.WARN)
+        }
+
+        this._CreateControls()
+        this.Render()        
+    }
 
     _EnsureRenderer() {
         if (!this.HasRenderer()) {
