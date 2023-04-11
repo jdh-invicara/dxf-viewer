@@ -215,7 +215,6 @@ export class DxfViewer {
         if (newFrag.tables) {
             // Looping through TABLES
             Object.entries(newFrag.tables).forEach(([k,v]) => {
-                console.log("Merging >> ", k)
                 if (this.parsedDxf.tables[k]) {
                     // update existing table
 
@@ -255,7 +254,41 @@ export class DxfViewer {
         this.worker = null
         this._BuildThreeJsScene(scene)
     }
-    
+
+    /** Add the array of entity objects into the previously loaded dxf object.  
+     * Convenient wrapper for AddDxfFragment
+     */
+    async AddDxfEntities({entities, fonts = null, progressCbk = null, workerFactory = null}) {
+        this.AddDxfFragment({ fragment: { entities }, fonts, progressCbk, workerFactory})
+    }    
+
+    /** Filter the handles out of the entity list and rebuild  
+     */
+    async RemoveDxfEntities({handles, fonts = null, progressCbk = null, workerFactory = null}) {
+        if (!this.parsedDxf) {
+            throw new Error("You must use option `retainParsedDXF` to use this feature")
+        }
+        if (!Array.isArray(handles)) {
+            // TODO: implement proper schema checking
+            throw new Error("`handles` must be an array of dxf entity handles (case sensitive)")
+        }
+
+        // STEP ONE: filter the entities array
+        let targets = new Set(handles)
+
+        this.parsedDxf.entities = this.parsedDxf.entities.filter(e => !targets.has(e.handle))
+
+        // STEP TWO: rebuild a new scene
+        this._EnsureRenderer()
+        this.Clear()
+        this.worker = new DxfWorker(workerFactory ? workerFactory() : null)
+        const scene = await this.worker.BuildScene(this.parsedDxf, fonts, progressCbk, workerFactory)
+        await this.worker.Destroy()
+        this.worker = null
+        this._BuildThreeJsScene(scene)
+    }    
+
+
     Render() {
         this._EnsureRenderer()
         this.renderer.render(this.scene, this.camera)
